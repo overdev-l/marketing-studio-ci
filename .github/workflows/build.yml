@@ -1,0 +1,187 @@
+# Marketing Studio Electron 应用 — GitHub Actions 构建 + 发布
+# 触发方式：overdev-team/auto-marketing 通过 Repository Dispatch API 触发
+# 产物发布到本仓库的 GitHub Releases
+
+name: Build & Deploy
+
+on:
+  repository_dispatch:
+    types: [trigger-build]
+
+env:
+  TAG: ${{ github.event.client_payload.tag }}
+  CHANNEL: ${{ github.event.client_payload.channel }}
+  VERSION: ${{ github.event.client_payload.version }}
+
+jobs:
+  build-and-deploy:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    timeout-minutes: 60
+    steps:
+      - name: Clone source repo
+        env:
+          MARKETING_STUDIO_REPO_PAT: ${{ secrets.MARKETING_STUDIO_REPO_PAT }}
+        run: |
+          git config --global credential.helper ''
+          git clone --branch "$TAG" \
+            "https://x-access-token:${MARKETING_STUDIO_REPO_PAT}@github.com/overdev-team/auto-marketing.git" \
+            workspace
+          cd workspace
+          git fetch --tags
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pnpm
+        run: npm install -g pnpm@9
+
+      - name: Install dependencies
+        working-directory: workspace
+        run: |
+          rm -f package-lock.json
+          NODE_ENV=development pnpm install --no-frozen-lockfile --shamefully-hoist 2>&1 | tail -5
+          cd figma-plugin && npm ci 2>&1 | tail -3 && cd ..
+          cd photoshop-plugin && npm ci 2>&1 | tail -3 && cd ..
+
+      - name: Build plugins
+        working-directory: workspace
+        run: |
+          echo "::group::构建 Figma 插件"
+          cd figma-plugin && npm run build && cd ..
+          echo "::endgroup::"
+          echo "::group::构建 Photoshop 插件"
+          cd photoshop-plugin && npm run build && cd ..
+          echo "::endgroup::"
+
+      - name: Build renderer
+        working-directory: workspace
+        run: |
+          echo "::group::TypeScript & Vite 构建"
+          ./node_modules/.bin/tsc && ./node_modules/.bin/vite build
+          echo "::endgroup::"
+
+      - name: Build Electron (macOS)
+        working-directory: workspace
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          set -eo pipefail
+          echo "::group::构建 Electron 主进程"
+          npm run build:electron
+          test -f dist-electron/main.mjs
+          echo "::endgroup::"
+          echo "::group::裁剪 devDependencies + 删除 plugin node_modules（防 electron-builder 扫描 OOM）"
+          pnpm prune --prod 2>&1 | tail -5
+          rm -rf figma-plugin/node_modules photoshop-plugin/node_modules
+          du -sh node_modules figma-plugin photoshop-plugin || true
+          echo "::endgroup::"
+          echo "::group::electron-builder"
+          npx electron-builder@26.8.1 --mac --publish never -c.electronVersion=41.0.0
+          echo "::endgroup::"
+          echo "构建产物："
+          ls -lh release/*.dmg release/*.zip release/*.blockmap release/latest-mac.yml
+
+      - name: Generate changelog
+        working-directory: workspace
+        run: |
+          PREVIOUS_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -n 1)
+          echo "当前 tag: ${TAG}"
+          echo "上一个 tag: ${PREVIOUS_TAG:-'(无)'}"
+          if [ -z "$PREVIOUS_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"- %s" "$TAG" | grep -E "^- (feat|fix)" || git log --pretty=format:"- %s" -20)
+          else
+            CHANGELOG=$(git log --pretty=format:"- %s" "${PREVIOUS_TAG}..${TAG}" | grep -E "^- (feat|fix)" || git log --pretty=format:"- %s" "${PREVIOUS_TAG}..${TAG}")
+          fi
+          echo "$CHANGELOG" > changelog.txt
+          echo "=== Changelog ==="
+          cat changelog.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "Marketing Studio v${{ env.VERSION }}"
+          body_path: workspace/changelog.txt
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            workspace/release/*.dmg
+            workspace/release/*.zip
+            workspace/release/*.blockmap
+            workspace/release/latest-mac.yml
+
+      - name: Update channel release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHANNEL_TAG="update"
+          DOWNLOAD_BASE="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}"
+          echo "通道: ${CHANNEL_TAG} | 版本: ${TAG}"
+
+          cd workspace/release
+          sed "s|url: Marketing Studio-|url: ${DOWNLOAD_BASE}/Marketing Studio-|g; s|^path: Marketing Studio-|path: ${DOWNLOAD_BASE}/Marketing Studio-|g" latest-mac.yml > latest-mac-channel.yml
+          mv latest-mac-channel.yml latest-mac.yml
+          cat latest-mac.yml
+          cd ../..
+
+          RELEASE_ID=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases/tags/${CHANNEL_TAG}" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "通道 release 不存在，跳过"
+            exit 0
+          fi
+          echo "Release ID: ${RELEASE_ID}"
+
+          ASSET_ID=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases/${RELEASE_ID}/assets" | python3 -c 'import sys,json;[print(a["id"]) for a in json.load(sys.stdin) if a["name"]=="latest-mac.yml"]' 2>/dev/null)
+
+          if [ -n "$ASSET_ID" ]; then
+            curl -s -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases/assets/${ASSET_ID}" || true
+            echo "删除旧 asset: ${ASSET_ID}"
+          fi
+
+          curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/octet-stream" --data-binary "@workspace/release/latest-mac.yml" "https://uploads.github.com/repos/overdev-l/marketing-studio-ci/releases/${RELEASE_ID}/assets?name=latest-mac.yml" > /dev/null
+          echo "✅ 通道 ${CHANNEL_TAG} 已更新到 v${VERSION}"
+        continue-on-error: true
+
+      - name: Feishu notification
+        working-directory: workspace
+        env:
+          FEISHU_WEBHOOK: https://open.feishu.cn/open-apis/bot/v2/hook/d55b0ff3-12ed-416f-9523-28d8055cca46
+        run: |
+          DMG_FILE=$(basename "$(ls release/*.dmg | head -n 1)" 2>/dev/null || echo "Marketing Studio-${VERSION}.dmg")
+          export DMG_URL="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}/${DMG_FILE}"
+          cat > /tmp/feishu.py <<'PYEOF'
+          import json, os
+          changelog = open('changelog.txt').read().strip()
+          v = os.environ['VERSION']
+          ch = os.environ['CHANNEL']
+          content = '**版本号：** ' + v + '\n**通道：** ' + ch + '\n\n---\n\n**更新内容：**\n' + changelog
+          payload = {
+              'msg_type': 'interactive',
+              'card': {
+                  'header': {'title': {'tag': 'plain_text', 'content': '🚀 Marketing Studio ' + v + ' 已发布'}, 'template': 'blue'},
+                  'elements': [
+                      {'tag': 'markdown', 'content': content},
+                      {'tag': 'action', 'actions': [
+                          {'tag': 'button',
+                           'text': {'tag': 'plain_text', 'content': '下载 DMG'},
+                           'type': 'primary',
+                           'url': os.environ['DMG_URL']}
+                      ]}
+                  ]
+              }
+          }
+          print(json.dumps(payload, ensure_ascii=False))
+          PYEOF
+          # heredoc 保留了缩进——去掉
+          sed -i '' 's/^          //' /tmp/feishu.py 2>/dev/null || sed -i 's/^          //' /tmp/feishu.py
+          PAYLOAD=$(python3 /tmp/feishu.py)
+          RESP=$(curl -s -X POST "$FEISHU_WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD")
+          echo "飞书响应: $RESP"
+          echo "$RESP" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin).get('code',0)==0 else 1)" \
+            && echo "✅ 飞书通知已发送" \
+            || { echo "❌ 飞书通知失败"; exit 1; }
