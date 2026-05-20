@@ -1,6 +1,8 @@
-# Marketing Studio Electron 应用 — GitHub Actions 构建 + 发布
+# Marketing Studio Electron 应用 — GitHub Actions 构建 + 发布（Velopack 自动更新）
 # 触发方式：overdev-team/marketing-studio 通过 Repository Dispatch API 触发
-# 产物发布到本仓库的 GitHub Releases
+# 产物：
+#   - tag=<version>: .dmg / .zip（首次下载手动安装）
+#   - tag=update: releases.osx.json + *.nupkg（Velopack 自动更新清单 + 增量包）
 
 name: Build & Deploy
 
@@ -36,6 +38,17 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup .NET (for Velopack vpk)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install Velopack CLI
+        run: |
+          dotnet tool install -g vpk --version 0.0.1589-ga2c5a97
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+          "$HOME/.dotnet/tools/vpk" --help | head -n 5
+
       - name: Install pnpm
         run: npm install -g pnpm@10.31.0
 
@@ -51,13 +64,13 @@ jobs:
           pnpm run build:renderer
           echo "::endgroup::"
 
-      - name: Build Electron (macOS)
+      - name: Build Electron main
         working-directory: workspace
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
           set -eo pipefail
-          echo "::group::构建 Electron 主进程"
+          echo "::group::Electron 主进程"
           pnpm run build:electron
           test -f dist-electron/main.mjs
           echo "::endgroup::"
@@ -68,41 +81,32 @@ jobs:
           pnpm prune --prod 2>&1 | tail -5
           du -sh node_modules || true
           echo "::endgroup::"
+
+      - name: Build .app + .dmg (electron-builder)
+        working-directory: workspace
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          set -eo pipefail
           echo "::group::electron-builder"
           npx electron-builder@26.8.1 --mac --publish never -c.electronVersion=41.0.0
           echo "::endgroup::"
-          echo "构建产物："
-          ls -lh release/*.dmg release/*.zip release/*.blockmap release/latest-mac.yml
+          echo "electron-builder 产物:"
+          ls -lh release/*.dmg release/*.zip 2>/dev/null || true
 
-      - name: Normalize release artifacts
+      - name: Pack Velopack release
         working-directory: workspace
+        env:
+          VELOPACK_PACK_VERSION: ${{ env.VERSION }}
+          VELOPACK_CHANNEL: osx
         run: |
-          set -euo pipefail
-          cd release
-
-          ZIP_FILE="$(ls *.zip | head -n 1)"
-          DMG_FILE="$(ls *.dmg | head -n 1)"
-          ZIP_TARGET="$(awk '/url: .*\.zip$/ {print $3; exit}' latest-mac.yml)"
-          DMG_TARGET="$(awk '/url: .*\.dmg$/ {print $3; exit}' latest-mac.yml)"
-
-          for value in "$ZIP_FILE" "$DMG_FILE" "$ZIP_TARGET" "$DMG_TARGET"; do
-            if [ -z "$value" ] || [[ "$value" == */* ]]; then
-              echo "非法产物文件名: ${value:-'(empty)'}"
-              exit 1
-            fi
-          done
-
-          if [ "$ZIP_FILE" != "$ZIP_TARGET" ]; then
-            mv "$ZIP_FILE" "$ZIP_TARGET"
-            mv "$ZIP_FILE.blockmap" "$ZIP_TARGET.blockmap"
-          fi
-          if [ "$DMG_FILE" != "$DMG_TARGET" ]; then
-            mv "$DMG_FILE" "$DMG_TARGET"
-            mv "$DMG_FILE.blockmap" "$DMG_TARGET.blockmap"
-          fi
-
-          echo "标准化后的构建产物："
-          ls -lh *.dmg *.zip *.blockmap latest-mac.yml
+          set -eo pipefail
+          echo "::group::vpk pack"
+          pnpm run release:velopack:mac
+          echo "::endgroup::"
+          echo "Velopack 产物:"
+          ls -lh release/velopack/
+          test -f release/velopack/releases.osx.json
 
       - name: Generate changelog
         working-directory: workspace
@@ -119,7 +123,7 @@ jobs:
           echo "=== Changelog ==="
           cat changelog.txt
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (tag=VERSION)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
@@ -130,81 +134,73 @@ jobs:
           files: |
             workspace/release/*.dmg
             workspace/release/*.zip
-            workspace/release/*.blockmap
-            workspace/release/latest-mac.yml
 
-      - name: Update channel release
+      - name: Update channel release (tag=update) — Velopack
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           CHANNEL_TAG="update"
-          DOWNLOAD_BASE="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}"
-          export DOWNLOAD_BASE
-          echo "通道: ${CHANNEL_TAG} | 版本: ${TAG}"
+          REPO="overdev-l/marketing-studio-ci"
+          echo "通道: ${CHANNEL_TAG} | 版本: ${VERSION}"
 
-          python3 <<'PYEOF'
-          import os
-          import re
-          from pathlib import Path
-
-          base = os.environ['DOWNLOAD_BASE'].rstrip('/')
-          path = Path('workspace/release/latest-mac.yml')
-          lines = []
-          for line in path.read_text().splitlines():
-              match = re.match(r'^(\s*(?:- )?(?:url|path):\s+)(\S.*)$', line)
-              if match:
-                  value = match.group(2).strip()
-                  if not re.match(r'^https?://', value):
-                      line = match.group(1) + base + '/' + value
-              lines.append(line)
-          path.write_text('\n'.join(lines) + '\n')
-          PYEOF
-          cat workspace/release/latest-mac.yml
-
-          RELEASE_ID=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases/tags/${CHANNEL_TAG}" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+          # 1. 找/创建 update release
+          RELEASE_ID=$(curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${REPO}/releases/tags/${CHANNEL_TAG}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
 
           if [ -z "$RELEASE_ID" ]; then
             echo "通道 release 不存在，创建 ${CHANNEL_TAG}"
-            RELEASE_ID=$(python3 <<'PYEOF' | curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/json" -d @- "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))'
-          import json
-          print(json.dumps({
-              "tag_name": "update",
-              "target_commitish": "main",
-              "name": "Marketing Studio update channel",
-              "body": "固定自动更新通道，只保存 latest-mac.yml。",
-              "prerelease": False
-          }, ensure_ascii=False))
-          PYEOF
-          )
+            RELEASE_ID=$(curl -fsSL -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"tag_name":"update","target_commitish":"main","name":"Marketing Studio update channel","body":"Velopack 自动更新通道（releases.osx.json + nupkg）","prerelease":false}' \
+              "https://api.github.com/repos/${REPO}/releases" \
+              | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))')
           fi
           if [ -z "$RELEASE_ID" ]; then
-            echo "无法获取或创建通道 release"
+            echo "❌ 无法获取/创建 update release"
             exit 1
           fi
           echo "Release ID: ${RELEASE_ID}"
 
-          ASSET_ID=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases/${RELEASE_ID}/assets" | python3 -c 'import sys,json;[print(a["id"]) for a in json.load(sys.stdin) if a["name"]=="latest-mac.yml"]' 2>/dev/null)
+          # 2. 清空 update tag 上所有旧 assets（包括残留的 latest-mac.yml 与上一版 nupkg）
+          curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets" \
+            | python3 -c 'import sys,json;[print(a["id"]) for a in json.load(sys.stdin)]' \
+            | while read -r ASSET_ID; do
+                [ -z "$ASSET_ID" ] && continue
+                echo "删除旧 asset ${ASSET_ID}"
+                curl -fsSL -X DELETE \
+                  -H "Authorization: token ${GITHUB_TOKEN}" \
+                  "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}" || true
+              done
 
-          if [ -n "$ASSET_ID" ]; then
-            curl -s -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases/assets/${ASSET_ID}" || true
-            echo "删除旧 asset: ${ASSET_ID}"
-          fi
-
-          UPLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: text/yaml" --data-binary "@workspace/release/latest-mac.yml" "https://uploads.github.com/repos/overdev-l/marketing-studio-ci/releases/${RELEASE_ID}/assets?name=latest-mac.yml")
-          UPLOAD_STATUS="${UPLOAD_RESPONSE##*$'\n'}"
-          if [[ ! "$UPLOAD_STATUS" =~ ^2 ]]; then
-            echo "上传 latest-mac.yml 失败: ${UPLOAD_STATUS}"
-            echo "${UPLOAD_RESPONSE%$'\n'*}"
-            exit 1
-          fi
-          echo "✅ 通道 ${CHANNEL_TAG} 已更新到 v${VERSION}"
+          # 3. 上传 Velopack 整目录到 update release
+          cd workspace/release/velopack
+          for f in *; do
+            [ -f "$f" ] || continue
+            CONTENT_TYPE="application/octet-stream"
+            case "$f" in
+              *.json) CONTENT_TYPE="application/json" ;;
+              *.yml|*.yaml) CONTENT_TYPE="text/yaml" ;;
+            esac
+            echo "上传 ${f} (${CONTENT_TYPE})"
+            curl -fsSL -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: ${CONTENT_TYPE}" \
+              --data-binary "@${f}" \
+              "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${f}" \
+              > /dev/null
+          done
+          echo "✅ update 通道已切换到 Velopack（v${VERSION}）"
 
       - name: Feishu notification
         working-directory: workspace
         env:
           FEISHU_WEBHOOK: https://open.feishu.cn/open-apis/bot/v2/hook/2ab8aae4-a857-46f5-8b99-14e3f7ceba80
         run: |
-          DMG_FILE=$(basename "$(ls release/*.dmg | head -n 1)" 2>/dev/null || echo "Marketing Studio-${VERSION}.dmg")
+          DMG_FILE=$(basename "$(ls release/*.dmg 2>/dev/null | head -n 1)" 2>/dev/null || echo "Marketing Studio-${VERSION}.dmg")
           export DMG_URL="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}/${DMG_FILE}"
           cat > /tmp/feishu.py <<'PYEOF'
           import json, os
@@ -229,7 +225,6 @@ jobs:
           }
           print(json.dumps(payload, ensure_ascii=False))
           PYEOF
-          # heredoc 保留了缩进——去掉
           sed -i '' 's/^          //' /tmp/feishu.py 2>/dev/null || sed -i 's/^          //' /tmp/feishu.py
           PAYLOAD=$(python3 /tmp/feishu.py)
           RESP=$(curl -s -X POST "$FEISHU_WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD")
