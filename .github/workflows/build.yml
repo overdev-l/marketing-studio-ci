@@ -101,8 +101,11 @@ jobs:
           VELOPACK_CHANNEL: osx
         run: |
           set -eo pipefail
+          # 注意：不用 pnpm run release:velopack:mac，它会重跑 build:renderer 走 tsc，
+          # 但 prune --prod 之后 typescript 已被删。前面 electron-builder --mac 已经产好
+          # .app（在 release/mac-arm64/ 下），这里只调 vpk pack。
           echo "::group::vpk pack"
-          pnpm run release:velopack:mac
+          node scripts/pack-velopack-release.mjs
           echo "::endgroup::"
           echo "Velopack 产物:"
           ls -lh release/velopack/
