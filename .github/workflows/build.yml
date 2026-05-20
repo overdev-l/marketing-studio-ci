@@ -74,6 +74,36 @@ jobs:
           echo "构建产物："
           ls -lh release/*.dmg release/*.zip release/*.blockmap release/latest-mac.yml
 
+      - name: Normalize release artifacts
+        working-directory: workspace
+        run: |
+          set -euo pipefail
+          cd release
+
+          ZIP_FILE="$(ls *.zip | head -n 1)"
+          DMG_FILE="$(ls *.dmg | head -n 1)"
+          ZIP_TARGET="$(awk '/url: .*\.zip$/ {print $3; exit}' latest-mac.yml)"
+          DMG_TARGET="$(awk '/url: .*\.dmg$/ {print $3; exit}' latest-mac.yml)"
+
+          for value in "$ZIP_FILE" "$DMG_FILE" "$ZIP_TARGET" "$DMG_TARGET"; do
+            if [ -z "$value" ] || [[ "$value" == */* ]]; then
+              echo "非法产物文件名: ${value:-'(empty)'}"
+              exit 1
+            fi
+          done
+
+          if [ "$ZIP_FILE" != "$ZIP_TARGET" ]; then
+            mv "$ZIP_FILE" "$ZIP_TARGET"
+            mv "$ZIP_FILE.blockmap" "$ZIP_TARGET.blockmap"
+          fi
+          if [ "$DMG_FILE" != "$DMG_TARGET" ]; then
+            mv "$DMG_FILE" "$DMG_TARGET"
+            mv "$DMG_FILE.blockmap" "$DMG_TARGET.blockmap"
+          fi
+
+          echo "标准化后的构建产物："
+          ls -lh *.dmg *.zip *.blockmap latest-mac.yml
+
       - name: Generate changelog
         working-directory: workspace
         run: |
@@ -109,19 +139,47 @@ jobs:
         run: |
           CHANNEL_TAG="update"
           DOWNLOAD_BASE="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}"
+          export DOWNLOAD_BASE
           echo "通道: ${CHANNEL_TAG} | 版本: ${TAG}"
 
-          cd workspace/release
-          sed "s|url: Marketing Studio-|url: ${DOWNLOAD_BASE}/Marketing Studio-|g; s|^path: Marketing Studio-|path: ${DOWNLOAD_BASE}/Marketing Studio-|g" latest-mac.yml > latest-mac-channel.yml
-          mv latest-mac-channel.yml latest-mac.yml
-          cat latest-mac.yml
-          cd ../..
+          python3 <<'PYEOF'
+          import os
+          import re
+          from pathlib import Path
+
+          base = os.environ['DOWNLOAD_BASE'].rstrip('/')
+          path = Path('workspace/release/latest-mac.yml')
+          lines = []
+          for line in path.read_text().splitlines():
+              match = re.match(r'^(\s*(?:- )?(?:url|path):\s+)(\S.*)$', line)
+              if match:
+                  value = match.group(2).strip()
+                  if not re.match(r'^https?://', value):
+                      line = match.group(1) + base + '/' + value
+              lines.append(line)
+          path.write_text('\n'.join(lines) + '\n')
+          PYEOF
+          cat workspace/release/latest-mac.yml
 
           RELEASE_ID=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases/tags/${CHANNEL_TAG}" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
 
           if [ -z "$RELEASE_ID" ]; then
-            echo "通道 release 不存在，跳过"
-            exit 0
+            echo "通道 release 不存在，创建 ${CHANNEL_TAG}"
+            RELEASE_ID=$(python3 <<'PYEOF' | curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/json" -d @- "https://api.github.com/repos/overdev-l/marketing-studio-ci/releases" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))'
+          import json
+          print(json.dumps({
+              "tag_name": "update",
+              "target_commitish": "main",
+              "name": "Marketing Studio update channel",
+              "body": "固定自动更新通道，只保存 latest-mac.yml。",
+              "prerelease": False
+          }, ensure_ascii=False))
+          PYEOF
+          )
+          fi
+          if [ -z "$RELEASE_ID" ]; then
+            echo "无法获取或创建通道 release"
+            exit 1
           fi
           echo "Release ID: ${RELEASE_ID}"
 
@@ -132,9 +190,14 @@ jobs:
             echo "删除旧 asset: ${ASSET_ID}"
           fi
 
-          curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/octet-stream" --data-binary "@workspace/release/latest-mac.yml" "https://uploads.github.com/repos/overdev-l/marketing-studio-ci/releases/${RELEASE_ID}/assets?name=latest-mac.yml" > /dev/null
+          UPLOAD_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: text/yaml" --data-binary "@workspace/release/latest-mac.yml" "https://uploads.github.com/repos/overdev-l/marketing-studio-ci/releases/${RELEASE_ID}/assets?name=latest-mac.yml")
+          UPLOAD_STATUS="${UPLOAD_RESPONSE##*$'\n'}"
+          if [[ ! "$UPLOAD_STATUS" =~ ^2 ]]; then
+            echo "上传 latest-mac.yml 失败: ${UPLOAD_STATUS}"
+            echo "${UPLOAD_RESPONSE%$'\n'*}"
+            exit 1
+          fi
           echo "✅ 通道 ${CHANNEL_TAG} 已更新到 v${VERSION}"
-        continue-on-error: true
 
       - name: Feishu notification
         working-directory: workspace
