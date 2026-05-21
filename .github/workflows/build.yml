@@ -1,12 +1,16 @@
 # Marketing Studio Electron 应用 — GitHub Actions 构建 + 发布（Velopack 自动更新）
 # 触发方式：overdev-team/marketing-studio 通过 Repository Dispatch API 触发
 # 产物：
-#   - tag=<version>: .dmg / .zip（首次下载手动安装）
-#   - tag=update: releases.osx.json / releases.osx-x64.json + *.nupkg（Velopack 自动更新清单 + 增量包）
+#   - tag=<version>: marketing-studio-<v>-{arm64,x64}.pkg
+#     (Velopack Setup.pkg,装上后即享受自动更新。原 dmg/zip 已废弃,
+#      dmg 安装的 .app 没有 Velopack runtime metadata,自动更新无法工作)
+#   - tag=update: releases.osx.json / releases.osx-x64.json + *.nupkg + *.pkg + *.Portable.zip
+#     (Velopack 自动更新通道)
 #
 # 结构：
-#   build (matrix arm64/x64) — 各自 clone/install/electron-builder/vpk pack/upload artifact，并行
-#   release (needs: build)   — 下载两份 artifact，发 GH Release、更新 update channel、飞书通知
+#   build (matrix arm64/x64) — 各自 clone/install/electron-builder --dir/vpk pack/upload artifact，并行
+#   release (needs: build)   — 下载两份 artifact，把 vpk Setup.pkg 重命名为友好名后发 GH Release、
+#                              更新 update channel、飞书通知
 
 name: Build & Deploy
 
@@ -97,17 +101,17 @@ jobs:
           du -sh node_modules || true
           echo "::endgroup::"
 
-      - name: Build .app + .dmg (electron-builder, ${{ matrix.arch }})
+      - name: Build .app (electron-builder --dir, ${{ matrix.arch }})
         working-directory: workspace
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
           set -eo pipefail
           echo "::group::electron-builder ${ARCH}"
+          # package.json mac.target=dir,只产出 .app 给 vpk pack 用。
           npx electron-builder@26.8.1 --mac --${ARCH} --publish never -c.electronVersion=41.0.0
           echo "::endgroup::"
-          echo "electron-builder 产物:"
-          ls -lh release/*.dmg release/*.zip 2>/dev/null || true
+          echo "electron-builder .app 产物:"
           ls -lh release/mac release/mac-${ARCH} 2>/dev/null || true
 
       - name: Pre-fetch previous Velopack nupkgs (${{ matrix.arch }})
@@ -165,10 +169,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.arch }}
-          path: |
-            workspace/release/*.dmg
-            workspace/release/*.zip
-            workspace/release/velopack-${{ matrix.arch }}/
+          # Setup.pkg / Portable.zip / nupkg / manifest 都在 velopack-${arch}/ 里
+          path: workspace/release/velopack-${{ matrix.arch }}/
           if-no-files-found: error
           retention-days: 7
 
@@ -198,15 +200,24 @@ jobs:
           pattern: dist-*
           merge-multiple: true
 
+      - name: Prepare friendly-named .pkg for GH Release
+        working-directory: workspace
+        run: |
+          set -euo pipefail
+          # vpk pack 默认产 com.overdev.marketing-studio-osx{,-x64}-Setup.pkg,
+          # 文件名里有 packId 不够友好。复制重命名后再传到 tag=<version>。
+          cp release/com.overdev.marketing-studio-osx-Setup.pkg \
+             release/marketing-studio-${VERSION}-arm64.pkg
+          cp release/com.overdev.marketing-studio-osx-x64-Setup.pkg \
+             release/marketing-studio-${VERSION}-x64.pkg
+          echo "=== 友好命名 .pkg ==="
+          ls -lh release/marketing-studio-${VERSION}-*.pkg
+
       - name: Inventory
         working-directory: workspace
         run: |
-          echo "=== release/ 顶层 ==="
+          echo "=== release/ 全部 (matrix 合并后,扁平) ==="
           ls -lh release/ 2>/dev/null || true
-          echo "=== velopack-arm64/ ==="
-          ls -lh release/velopack-arm64/ 2>/dev/null || true
-          echo "=== velopack-x64/ ==="
-          ls -lh release/velopack-x64/ 2>/dev/null || true
 
       - name: Generate changelog
         working-directory: workspace
@@ -232,8 +243,8 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: true
           files: |
-            workspace/release/*.dmg
-            workspace/release/*.zip
+            workspace/release/marketing-studio-${{ env.VERSION }}-arm64.pkg
+            workspace/release/marketing-studio-${{ env.VERSION }}-x64.pkg
 
       - name: Update channel release (tag=update) — Velopack
         env:
@@ -264,8 +275,17 @@ jobs:
           fi
           echo "Release ID: ${RELEASE_ID}"
 
-          # 2. 仅删本次会上传的同名 asset；历史 nupkg 保留供 delta 链
-          TO_UPLOAD=$(ls workspace/release/velopack-arm64 workspace/release/velopack-x64 2>/dev/null | sort -u | tr '\n' '|')
+          # 2. 收集 vpk 原始产物名 (排除我们 cp 重命名给 tag=<version> 的友好 .pkg);
+          #    仅这些会进 update channel 的"同名 asset 替换"逻辑
+          TO_UPLOAD=""
+          for f in workspace/release/*; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f")
+            case "$NAME" in
+              marketing-studio-*.pkg) continue ;;
+            esac
+            TO_UPLOAD="${TO_UPLOAD}${NAME}|"
+          done
 
           curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
             "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
@@ -283,26 +303,25 @@ jobs:
                 "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}" || true
             done
 
-          # 3. 上传 arm64 + x64 两个 velopack outputDir 下所有产物
-          for DIR in workspace/release/velopack-arm64 workspace/release/velopack-x64; do
-            [ -d "$DIR" ] || continue
-            echo "=== 上传 ${DIR} ==="
-            for f in "$DIR"/*; do
-              [ -f "$f" ] || continue
-              NAME=$(basename "$f")
-              CONTENT_TYPE="application/octet-stream"
-              case "$NAME" in
-                *.json) CONTENT_TYPE="application/json" ;;
-                *.yml|*.yaml) CONTENT_TYPE="text/yaml" ;;
-              esac
-              echo "上传 ${NAME} (${CONTENT_TYPE})"
-              curl -fsSL -X POST \
-                -H "Authorization: token ${GITHUB_TOKEN}" \
-                -H "Content-Type: ${CONTENT_TYPE}" \
-                --data-binary "@${f}" \
-                "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${NAME}" \
-                > /dev/null
-            done
+          # 3. 上传扁平 release/ 下所有 vpk 产物 (nupkg / json / yml / Setup.pkg / Portable.zip / RELEASES)
+          for f in workspace/release/*; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f")
+            case "$NAME" in
+              marketing-studio-*.pkg) continue ;;
+            esac
+            CONTENT_TYPE="application/octet-stream"
+            case "$NAME" in
+              *.json) CONTENT_TYPE="application/json" ;;
+              *.yml|*.yaml) CONTENT_TYPE="text/yaml" ;;
+            esac
+            echo "上传 ${NAME} (${CONTENT_TYPE})"
+            curl -fsSL -X POST \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: ${CONTENT_TYPE}" \
+              --data-binary "@${f}" \
+              "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${NAME}" \
+              > /dev/null
           done
           echo "✅ update 通道已发布 osx + osx-x64（v${VERSION}）"
 
@@ -311,14 +330,13 @@ jobs:
         env:
           FEISHU_WEBHOOK: https://open.feishu.cn/open-apis/bot/v2/hook/2ab8aae4-a857-46f5-8b99-14e3f7ceba80
         run: |
-          # 按 arch 找 dmg；找不到时给个合理默认（CI 流程跑到这步应已确定生成）
-          DMG_ARM64=$(basename "$(ls release/*arm64*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
-            || echo "marketing-studio-${VERSION}-arm64.dmg")
-          DMG_X64=$(basename "$(ls release/*x64*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
-            || echo "marketing-studio-${VERSION}-x64.dmg")
+          # 用 Prepare 步骤已经 cp 好的友好命名 .pkg。Setup.pkg 才有 Velopack runtime,
+          # 装上后 app 自动更新链路才会工作;dmg 已废弃。
+          PKG_ARM64="marketing-studio-${VERSION}-arm64.pkg"
+          PKG_X64="marketing-studio-${VERSION}-x64.pkg"
           REL_BASE="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}"
-          export DMG_URL_ARM64="${REL_BASE}/${DMG_ARM64}"
-          export DMG_URL_X64="${REL_BASE}/${DMG_X64}"
+          export PKG_URL_ARM64="${REL_BASE}/${PKG_ARM64}"
+          export PKG_URL_X64="${REL_BASE}/${PKG_X64}"
           # Windows 暂未构建。CI 一旦加 windows job,只需在此 export WIN_URL=... 即可让按钮自动出现。
           export WIN_URL=""
           cat > /tmp/feishu.py <<'PYEOF'
@@ -331,11 +349,11 @@ jobs:
               {'tag': 'button',
                'text': {'tag': 'plain_text', 'content': 'macOS (Apple Silicon)'},
                'type': 'primary',
-               'url': os.environ['DMG_URL_ARM64']},
+               'url': os.environ['PKG_URL_ARM64']},
               {'tag': 'button',
                'text': {'tag': 'plain_text', 'content': 'macOS (Intel)'},
                'type': 'default',
-               'url': os.environ['DMG_URL_X64']},
+               'url': os.environ['PKG_URL_X64']},
           ]
           win_url = os.environ.get('WIN_URL', '').strip()
           if win_url:
