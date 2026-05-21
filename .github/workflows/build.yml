@@ -2,7 +2,11 @@
 # 触发方式：overdev-team/marketing-studio 通过 Repository Dispatch API 触发
 # 产物：
 #   - tag=<version>: .dmg / .zip（首次下载手动安装）
-#   - tag=update: releases.osx.json + *.nupkg（Velopack 自动更新清单 + 增量包）
+#   - tag=update: releases.osx.json / releases.osx-x64.json + *.nupkg（Velopack 自动更新清单 + 增量包）
+#
+# 结构：
+#   build (matrix arm64/x64) — 各自 clone/install/electron-builder/vpk pack/upload artifact，并行
+#   release (needs: build)   — 下载两份 artifact，发 GH Release、更新 update channel、飞书通知
 
 name: Build & Deploy
 
@@ -16,11 +20,19 @@ env:
   VERSION: ${{ github.event.client_payload.version }}
 
 jobs:
-  build-and-deploy:
+  build:
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x64]
     permissions:
-      contents: write
-    timeout-minutes: 60
+      contents: read
+    timeout-minutes: 45
+    env:
+      ARCH: ${{ matrix.arch }}
+      # arm64 沿用 osx channel 不破已装客户端；x64 走 osx-x64
+      VELOPACK_CHANNEL: ${{ matrix.arch == 'arm64' && 'osx' || format('osx-{0}', matrix.arch) }}
     steps:
       - name: Clone source repo
         env:
@@ -82,80 +94,116 @@ jobs:
           du -sh node_modules || true
           echo "::endgroup::"
 
-      - name: Build .app + .dmg (electron-builder, arm64 + x64)
+      - name: Build .app + .dmg (electron-builder, ${{ matrix.arch }})
         working-directory: workspace
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
           set -eo pipefail
-          echo "::group::electron-builder"
-          npx electron-builder@26.8.1 --mac --arm64 --x64 --publish never -c.electronVersion=41.0.0
+          echo "::group::electron-builder ${ARCH}"
+          npx electron-builder@26.8.1 --mac --${ARCH} --publish never -c.electronVersion=41.0.0
           echo "::endgroup::"
           echo "electron-builder 产物:"
           ls -lh release/*.dmg release/*.zip 2>/dev/null || true
+          ls -lh release/mac release/mac-${ARCH} 2>/dev/null || true
 
-      - name: Pre-fetch previous Velopack nupkgs (for delta chain)
+      - name: Pre-fetch previous Velopack nupkgs (${{ matrix.arch }})
         working-directory: workspace
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Velopack 增量更新需要在 outputDir 里有上一版 full nupkg 才能算 delta。
-          # 把 update channel 上所有已存在的 nupkg 按 channel 拉到对应 outputDir。
+          # 增量 delta 需要上一版 full nupkg 在 outputDir。只拉当前 arch 的 channel。
           REPO="overdev-l/marketing-studio-ci"
-          mkdir -p release/velopack-arm64 release/velopack-x64
+          mkdir -p release/velopack-${ARCH}
 
           ASSETS_JSON=$(curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
             "https://api.github.com/repos/${REPO}/releases/tags/update" 2>/dev/null || echo '{"assets":[]}')
 
-          # arm64 兼容老用户继续用 osx channel；x64 走 osx-x64 channel
-          echo "$ASSETS_JSON" | python3 -c "
-          import sys, json
+          echo "$ASSETS_JSON" | ARCH="$ARCH" python3 -c "
+          import sys, json, os
           data = json.load(sys.stdin) if sys.stdin else {'assets': []}
+          arch = os.environ['ARCH']
           for a in (data.get('assets') or []):
               name = a['name']
               if not name.endswith('.nupkg'):
                   continue
-              # x64 channel 包名里会带 '-osx-x64-'；其余视为 arm64 (osx channel)
-              arch = 'x64' if '-osx-x64-' in name else 'arm64'
-              print(f\"{arch}\t{a['url']}\t{name}\")
-          " | while IFS=$'\t' read -r ARCH ASSET_API_URL NAME; do
+              asset_arch = 'x64' if '-osx-x64-' in name else 'arm64'
+              if asset_arch != arch:
+                  continue
+              print(f\"{a['url']}\t{name}\")
+          " | while IFS=$'\t' read -r ASSET_API_URL NAME; do
               [ -z "${NAME}" ] && continue
               DEST="release/velopack-${ARCH}/${NAME}"
               [ -f "$DEST" ] && { echo "跳过已存在 ${DEST}"; continue; }
-              echo "下载 ${NAME} → velopack-${ARCH}/"
+              echo "下载 ${NAME}"
               curl -fsSL \
                 -H "Authorization: token ${GITHUB_TOKEN}" \
                 -H "Accept: application/octet-stream" \
                 -o "${DEST}" \
                 "${ASSET_API_URL}" || echo "(skip ${NAME})"
             done
-          echo "arm64 outputDir:"; ls -lh release/velopack-arm64/ 2>/dev/null || true
-          echo "x64 outputDir:";   ls -lh release/velopack-x64/   2>/dev/null || true
+          ls -lh release/velopack-${ARCH}/ 2>/dev/null || true
 
-      - name: Pack Velopack release (arm64, channel=osx)
+      - name: Pack Velopack release (${{ matrix.arch }})
         working-directory: workspace
         env:
           VELOPACK_PACK_VERSION: ${{ env.VERSION }}
         run: |
           set -eo pipefail
-          echo "::group::vpk pack arm64"
-          node scripts/pack-velopack-release.mjs --arch arm64
+          echo "::group::vpk pack ${ARCH}"
+          node scripts/pack-velopack-release.mjs --arch ${ARCH}
           echo "::endgroup::"
-          ls -lh release/velopack-arm64/
-          test -f release/velopack-arm64/releases.osx.json
+          ls -lh release/velopack-${ARCH}/
+          MANIFEST="release/velopack-${ARCH}/releases.${VELOPACK_CHANNEL}.json"
+          test -f "$MANIFEST" || { echo "缺少 $MANIFEST"; exit 1; }
 
-      - name: Pack Velopack release (x64, channel=osx-x64)
-        working-directory: workspace
+      - name: Upload dist artifact (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            workspace/release/*.dmg
+            workspace/release/*.zip
+            workspace/release/velopack-${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    timeout-minutes: 15
+    steps:
+      - name: Clone source repo (for changelog)
         env:
-          VELOPACK_PACK_VERSION: ${{ env.VERSION }}
+          MARKETING_STUDIO_REPO_PAT: ${{ secrets.MARKETING_STUDIO_REPO_PAT }}
         run: |
-          set -eo pipefail
-          echo "::group::vpk pack x64"
-          node scripts/pack-velopack-release.mjs --arch x64
-          echo "::endgroup::"
-          ls -lh release/velopack-x64/
-          test -f release/velopack-x64/releases.osx-x64.json
+          git config --global credential.helper ''
+          # 需要历史 tag 才能算 PREVIOUS_TAG，不能 --depth 1
+          git clone --branch "$TAG" \
+            "https://x-access-token:${MARKETING_STUDIO_REPO_PAT}@github.com/overdev-team/marketing-studio.git" \
+            workspace
+          cd workspace
+          git fetch --tags
+
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: workspace/release
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: Inventory
+        working-directory: workspace
+        run: |
+          echo "=== release/ 顶层 ==="
+          ls -lh release/ 2>/dev/null || true
+          echo "=== velopack-arm64/ ==="
+          ls -lh release/velopack-arm64/ 2>/dev/null || true
+          echo "=== velopack-x64/ ==="
+          ls -lh release/velopack-x64/ 2>/dev/null || true
 
       - name: Generate changelog
         working-directory: workspace
@@ -213,13 +261,12 @@ jobs:
           fi
           echo "Release ID: ${RELEASE_ID}"
 
-          # 2. 把当前要上传的文件名收集起来，仅删 update release 上同名的旧 asset。
-          # 历史 nupkg 不删（Velopack delta 链需要旧版 full nupkg 才能让客户端逐版升）。
+          # 2. 仅删本次会上传的同名 asset；历史 nupkg 保留供 delta 链
           TO_UPLOAD=$(ls workspace/release/velopack-arm64 workspace/release/velopack-x64 2>/dev/null | sort -u | tr '\n' '|')
 
           curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
             "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
-            | python3 -c "
+            | TO_UPLOAD="$TO_UPLOAD" python3 -c "
           import sys, json, os
           to_upload = set([n for n in os.environ.get('TO_UPLOAD','').split('|') if n])
           for a in json.load(sys.stdin):
@@ -232,9 +279,8 @@ jobs:
                 -H "Authorization: token ${GITHUB_TOKEN}" \
                 "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}" || true
             done
-          export TO_UPLOAD
 
-          # 3. 上传 arm64 + x64 两个 outputDir 下所有 velopack 产物
+          # 3. 上传 arm64 + x64 两个 velopack outputDir 下所有产物
           for DIR in workspace/release/velopack-arm64 workspace/release/velopack-x64; do
             [ -d "$DIR" ] || continue
             echo "=== 上传 ${DIR} ==="
@@ -262,7 +308,6 @@ jobs:
         env:
           FEISHU_WEBHOOK: https://open.feishu.cn/open-apis/bot/v2/hook/2ab8aae4-a857-46f5-8b99-14e3f7ceba80
         run: |
-          # arm64 优先（绝大多数 Mac 用户），找不到再回退到第一个 .dmg
           DMG_FILE=$(basename "$(ls release/*arm64*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
             || basename "$(ls release/*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
             || echo "marketing-studio-${VERSION}-arm64.dmg")
@@ -290,7 +335,7 @@ jobs:
           }
           print(json.dumps(payload, ensure_ascii=False))
           PYEOF
-          sed -i '' 's/^          //' /tmp/feishu.py 2>/dev/null || sed -i 's/^          //' /tmp/feishu.py
+          sed -i 's/^          //' /tmp/feishu.py
           PAYLOAD=$(python3 /tmp/feishu.py)
           RESP=$(curl -s -X POST "$FEISHU_WEBHOOK" -H "Content-Type: application/json" -d "$PAYLOAD")
           echo "飞书响应: $RESP"
