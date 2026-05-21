@@ -18,6 +18,9 @@ env:
   TAG: ${{ github.event.client_payload.tag }}
   CHANNEL: ${{ github.event.client_payload.channel }}
   VERSION: ${{ github.event.client_payload.version }}
+  # 让 v4 JS actions (setup-node/setup-dotnet/upload-artifact) 内部跑在 Node 24 上,
+  # 提前对齐 2026-06-02 GitHub 强制切换,消除 deprecation 警告。与项目构建用的 Node 25 独立。
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   build:
@@ -48,7 +51,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '25'
 
       - name: Setup .NET (for Velopack vpk)
         uses: actions/setup-dotnet@v4
