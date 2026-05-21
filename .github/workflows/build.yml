@@ -311,28 +311,47 @@ jobs:
         env:
           FEISHU_WEBHOOK: https://open.feishu.cn/open-apis/bot/v2/hook/2ab8aae4-a857-46f5-8b99-14e3f7ceba80
         run: |
-          DMG_FILE=$(basename "$(ls release/*arm64*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
-            || basename "$(ls release/*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
+          # 按 arch 找 dmg；找不到时给个合理默认（CI 流程跑到这步应已确定生成）
+          DMG_ARM64=$(basename "$(ls release/*arm64*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
             || echo "marketing-studio-${VERSION}-arm64.dmg")
-          export DMG_URL="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}/${DMG_FILE}"
+          DMG_X64=$(basename "$(ls release/*x64*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
+            || echo "marketing-studio-${VERSION}-x64.dmg")
+          REL_BASE="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}"
+          export DMG_URL_ARM64="${REL_BASE}/${DMG_ARM64}"
+          export DMG_URL_X64="${REL_BASE}/${DMG_X64}"
+          # Windows 暂未构建。CI 一旦加 windows job,只需在此 export WIN_URL=... 即可让按钮自动出现。
+          export WIN_URL=""
           cat > /tmp/feishu.py <<'PYEOF'
           import json, os
           changelog = open('changelog.txt').read().strip()
           v = os.environ['VERSION']
           ch = os.environ['CHANNEL']
           content = '**版本号：** ' + v + '\n**通道：** ' + ch + '\n\n---\n\n**更新内容：**\n' + changelog
+          buttons = [
+              {'tag': 'button',
+               'text': {'tag': 'plain_text', 'content': 'macOS (Apple Silicon)'},
+               'type': 'primary',
+               'url': os.environ['DMG_URL_ARM64']},
+              {'tag': 'button',
+               'text': {'tag': 'plain_text', 'content': 'macOS (Intel)'},
+               'type': 'default',
+               'url': os.environ['DMG_URL_X64']},
+          ]
+          win_url = os.environ.get('WIN_URL', '').strip()
+          if win_url:
+              buttons.append({
+                  'tag': 'button',
+                  'text': {'tag': 'plain_text', 'content': 'Windows'},
+                  'type': 'default',
+                  'url': win_url,
+              })
           payload = {
               'msg_type': 'interactive',
               'card': {
                   'header': {'title': {'tag': 'plain_text', 'content': '🚀 Marketing Studio ' + v + ' 已发布'}, 'template': 'blue'},
                   'elements': [
                       {'tag': 'markdown', 'content': content},
-                      {'tag': 'action', 'actions': [
-                          {'tag': 'button',
-                           'text': {'tag': 'plain_text', 'content': '下载 DMG'},
-                           'type': 'primary',
-                           'url': os.environ['DMG_URL']}
-                      ]}
+                      {'tag': 'action', 'actions': buttons},
                   ]
               }
           }
