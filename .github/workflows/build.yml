@@ -82,34 +82,80 @@ jobs:
           du -sh node_modules || true
           echo "::endgroup::"
 
-      - name: Build .app + .dmg (electron-builder)
+      - name: Build .app + .dmg (electron-builder, arm64 + x64)
         working-directory: workspace
         env:
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
           set -eo pipefail
           echo "::group::electron-builder"
-          npx electron-builder@26.8.1 --mac --publish never -c.electronVersion=41.0.0
+          npx electron-builder@26.8.1 --mac --arm64 --x64 --publish never -c.electronVersion=41.0.0
           echo "::endgroup::"
           echo "electron-builder 产物:"
           ls -lh release/*.dmg release/*.zip 2>/dev/null || true
 
-      - name: Pack Velopack release
+      - name: Pre-fetch previous Velopack nupkgs (for delta chain)
+        working-directory: workspace
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Velopack 增量更新需要在 outputDir 里有上一版 full nupkg 才能算 delta。
+          # 把 update channel 上所有已存在的 nupkg 按 channel 拉到对应 outputDir。
+          REPO="overdev-l/marketing-studio-ci"
+          mkdir -p release/velopack-arm64 release/velopack-x64
+
+          ASSETS_JSON=$(curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${REPO}/releases/tags/update" 2>/dev/null || echo '{"assets":[]}')
+
+          # arm64 兼容老用户继续用 osx channel；x64 走 osx-x64 channel
+          echo "$ASSETS_JSON" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin) if sys.stdin else {'assets': []}
+          for a in (data.get('assets') or []):
+              name = a['name']
+              if not name.endswith('.nupkg'):
+                  continue
+              # x64 channel 包名里会带 '-osx-x64-'；其余视为 arm64 (osx channel)
+              arch = 'x64' if '-osx-x64-' in name else 'arm64'
+              print(f\"{arch}\t{a['url']}\t{name}\")
+          " | while IFS=$'\t' read -r ARCH ASSET_API_URL NAME; do
+              [ -z "${NAME}" ] && continue
+              DEST="release/velopack-${ARCH}/${NAME}"
+              [ -f "$DEST" ] && { echo "跳过已存在 ${DEST}"; continue; }
+              echo "下载 ${NAME} → velopack-${ARCH}/"
+              curl -fsSL \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Accept: application/octet-stream" \
+                -o "${DEST}" \
+                "${ASSET_API_URL}" || echo "(skip ${NAME})"
+            done
+          echo "arm64 outputDir:"; ls -lh release/velopack-arm64/ 2>/dev/null || true
+          echo "x64 outputDir:";   ls -lh release/velopack-x64/   2>/dev/null || true
+
+      - name: Pack Velopack release (arm64, channel=osx)
         working-directory: workspace
         env:
           VELOPACK_PACK_VERSION: ${{ env.VERSION }}
-          VELOPACK_CHANNEL: osx
         run: |
           set -eo pipefail
-          # 注意：不用 pnpm run release:velopack:mac，它会重跑 build:renderer 走 tsc，
-          # 但 prune --prod 之后 typescript 已被删。前面 electron-builder --mac 已经产好
-          # .app（在 release/mac-arm64/ 下），这里只调 vpk pack。
-          echo "::group::vpk pack"
-          node scripts/pack-velopack-release.mjs
+          echo "::group::vpk pack arm64"
+          node scripts/pack-velopack-release.mjs --arch arm64
           echo "::endgroup::"
-          echo "Velopack 产物:"
-          ls -lh release/velopack/
-          test -f release/velopack/releases.osx.json
+          ls -lh release/velopack-arm64/
+          test -f release/velopack-arm64/releases.osx.json
+
+      - name: Pack Velopack release (x64, channel=osx-x64)
+        working-directory: workspace
+        env:
+          VELOPACK_PACK_VERSION: ${{ env.VERSION }}
+        run: |
+          set -eo pipefail
+          echo "::group::vpk pack x64"
+          node scripts/pack-velopack-release.mjs --arch x64
+          echo "::endgroup::"
+          ls -lh release/velopack-x64/
+          test -f release/velopack-x64/releases.osx-x64.json
 
       - name: Generate changelog
         working-directory: workspace
@@ -157,7 +203,7 @@ jobs:
             RELEASE_ID=$(curl -fsSL -X POST \
               -H "Authorization: token ${GITHUB_TOKEN}" \
               -H "Content-Type: application/json" \
-              -d '{"tag_name":"update","target_commitish":"main","name":"Marketing Studio update channel","body":"Velopack 自动更新通道（releases.osx.json + nupkg）","prerelease":false}' \
+              -d '{"tag_name":"update","target_commitish":"main","name":"Marketing Studio update channel","body":"Velopack 自动更新通道（osx / osx-x64 channel）","prerelease":false}' \
               "https://api.github.com/repos/${REPO}/releases" \
               | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))')
           fi
@@ -167,43 +213,59 @@ jobs:
           fi
           echo "Release ID: ${RELEASE_ID}"
 
-          # 2. 清空 update tag 上所有旧 assets（包括残留的 latest-mac.yml 与上一版 nupkg）
-          curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets" \
-            | python3 -c 'import sys,json;[print(a["id"]) for a in json.load(sys.stdin)]' \
-            | while read -r ASSET_ID; do
-                [ -z "$ASSET_ID" ] && continue
-                echo "删除旧 asset ${ASSET_ID}"
-                curl -fsSL -X DELETE \
-                  -H "Authorization: token ${GITHUB_TOKEN}" \
-                  "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}" || true
-              done
+          # 2. 把当前要上传的文件名收集起来，仅删 update release 上同名的旧 asset。
+          # 历史 nupkg 不删（Velopack delta 链需要旧版 full nupkg 才能让客户端逐版升）。
+          TO_UPLOAD=$(ls workspace/release/velopack-arm64 workspace/release/velopack-x64 2>/dev/null | sort -u | tr '\n' '|')
 
-          # 3. 上传 Velopack 整目录到 update release
-          cd workspace/release/velopack
-          for f in *; do
-            [ -f "$f" ] || continue
-            CONTENT_TYPE="application/octet-stream"
-            case "$f" in
-              *.json) CONTENT_TYPE="application/json" ;;
-              *.yml|*.yaml) CONTENT_TYPE="text/yaml" ;;
-            esac
-            echo "上传 ${f} (${CONTENT_TYPE})"
-            curl -fsSL -X POST \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: ${CONTENT_TYPE}" \
-              --data-binary "@${f}" \
-              "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${f}" \
-              > /dev/null
+          curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
+            "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
+            | python3 -c "
+          import sys, json, os
+          to_upload = set([n for n in os.environ.get('TO_UPLOAD','').split('|') if n])
+          for a in json.load(sys.stdin):
+              if a['name'] in to_upload:
+                  print(a['id'], a['name'])
+          " | while read -r ASSET_ID ASSET_NAME; do
+              [ -z "$ASSET_ID" ] && continue
+              echo "删除同名旧 asset ${ASSET_NAME} (${ASSET_ID})"
+              curl -fsSL -X DELETE \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}" || true
+            done
+          export TO_UPLOAD
+
+          # 3. 上传 arm64 + x64 两个 outputDir 下所有 velopack 产物
+          for DIR in workspace/release/velopack-arm64 workspace/release/velopack-x64; do
+            [ -d "$DIR" ] || continue
+            echo "=== 上传 ${DIR} ==="
+            for f in "$DIR"/*; do
+              [ -f "$f" ] || continue
+              NAME=$(basename "$f")
+              CONTENT_TYPE="application/octet-stream"
+              case "$NAME" in
+                *.json) CONTENT_TYPE="application/json" ;;
+                *.yml|*.yaml) CONTENT_TYPE="text/yaml" ;;
+              esac
+              echo "上传 ${NAME} (${CONTENT_TYPE})"
+              curl -fsSL -X POST \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                -H "Content-Type: ${CONTENT_TYPE}" \
+                --data-binary "@${f}" \
+                "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${NAME}" \
+                > /dev/null
+            done
           done
-          echo "✅ update 通道已切换到 Velopack（v${VERSION}）"
+          echo "✅ update 通道已发布 osx + osx-x64（v${VERSION}）"
 
       - name: Feishu notification
         working-directory: workspace
         env:
           FEISHU_WEBHOOK: https://open.feishu.cn/open-apis/bot/v2/hook/2ab8aae4-a857-46f5-8b99-14e3f7ceba80
         run: |
-          DMG_FILE=$(basename "$(ls release/*.dmg 2>/dev/null | head -n 1)" 2>/dev/null || echo "Marketing Studio-${VERSION}.dmg")
+          # arm64 优先（绝大多数 Mac 用户），找不到再回退到第一个 .dmg
+          DMG_FILE=$(basename "$(ls release/*arm64*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
+            || basename "$(ls release/*.dmg 2>/dev/null | head -n 1)" 2>/dev/null \
+            || echo "marketing-studio-${VERSION}-arm64.dmg")
           export DMG_URL="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}/${DMG_FILE}"
           cat > /tmp/feishu.py <<'PYEOF'
           import json, os
