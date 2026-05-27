@@ -1,9 +1,11 @@
 # Marketing Studio Electron 应用 — GitHub Actions 构建 + 发布（Velopack 自动更新）
 # 触发方式：overdev-team/marketing-studio 通过 Repository Dispatch API 触发
 # 产物：
-#   - tag=<version>: marketing-studio-<v>-{arm64,x64}.pkg
+#   - tag=<version>: marketing-studio-<v>-{arm64,x64}.pkg + Velopack feed assets
 #     (Velopack Setup.pkg,装上后即享受自动更新。原 dmg/zip 已废弃,
-#      dmg 安装的 .app 没有 Velopack runtime metadata,自动更新无法工作)
+#      dmg 安装的 .app 没有 Velopack runtime metadata,自动更新无法工作。
+#      版本 release 也必须带 releases.osx*.json + nupkg,否则 GitHubSource
+#      只扫描最近 10 个 release 时会跳过固定 update tag)
 #   - tag=update: releases.osx.json / releases.osx-x64.json + *.nupkg + *.pkg + *.Portable.zip
 #     (Velopack 自动更新通道)
 #
@@ -219,6 +221,26 @@ jobs:
           echo "=== release/ 全部 (matrix 合并后,扁平) ==="
           ls -lh release/ 2>/dev/null || true
 
+      - name: Verify version release Velopack assets
+        working-directory: workspace
+        run: |
+          set -euo pipefail
+          required=(
+            "release/releases.osx.json"
+            "release/releases.osx-x64.json"
+            "release/assets.osx.json"
+            "release/assets.osx-x64.json"
+            "release/RELEASES-osx"
+            "release/RELEASES-osx-x64"
+            "release/com.overdev.marketing-studio-${VERSION}-osx-full.nupkg"
+            "release/com.overdev.marketing-studio-${VERSION}-osx-x64-full.nupkg"
+            "release/com.overdev.marketing-studio-${VERSION}-osx-delta.nupkg"
+            "release/com.overdev.marketing-studio-${VERSION}-osx-x64-delta.nupkg"
+          )
+          for file in "${required[@]}"; do
+            test -f "$file" || { echo "缺少版本 release 必需资产: $file"; exit 1; }
+          done
+
       - name: Generate changelog
         working-directory: workspace
         run: |
@@ -245,6 +267,10 @@ jobs:
           files: |
             workspace/release/marketing-studio-${{ env.VERSION }}-arm64.pkg
             workspace/release/marketing-studio-${{ env.VERSION }}-x64.pkg
+            workspace/release/assets.osx*.json
+            workspace/release/RELEASES-osx*
+            workspace/release/releases.osx*.json
+            workspace/release/*.nupkg
 
       - name: Update channel release (tag=update) — Velopack
         env:
