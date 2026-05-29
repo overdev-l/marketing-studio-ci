@@ -7,12 +7,11 @@
 #      版本 release 也必须带 releases.osx*.json + nupkg,否则 GitHubSource
 #      只扫描最近 10 个 release 时会跳过固定 update tag)
 #   - tag=update: GitHub 兼容通道，供旧客户端继续升级
-#   - 完成后回调 overdev-team/marketing-studio，由源仓库用自己的 R2 密钥同步更新源
 #
 # 结构：
 #   build (matrix arm64/x64) — 各自 clone/install/electron-builder --dir/vpk pack/upload artifact，并行
 #   release (needs: build)   — 下载两份 artifact，把 vpk Setup.pkg 重命名为友好名后发 GH Release、
-#                              更新 GitHub update channel、触发源仓库 R2 同步、飞书通知
+#                              更新 GitHub update channel、飞书通知
 
 name: Build & Deploy
 
@@ -348,41 +347,6 @@ jobs:
           printf '  %s\n' "${UPLOAD_FILES[@]}"
           gh release upload "${CHANNEL_TAG}" "${UPLOAD_FILES[@]}" --repo "${REPO}" --clobber
           echo "✅ update 通道已发布 osx + osx-x64（v${VERSION}）"
-
-      - name: Dispatch R2 sync to source repo
-        env:
-          MARKETING_STUDIO_REPO_PAT: ${{ secrets.MARKETING_STUDIO_REPO_PAT }}
-        run: |
-          set -euo pipefail
-          if [ -z "${MARKETING_STUDIO_REPO_PAT}" ]; then
-            echo "::error::缺失 MARKETING_STUDIO_REPO_PAT"
-            exit 1
-          fi
-          payload=$(python3 - <<'PY'
-          import json, os
-          print(json.dumps({
-              'ref': os.environ['TAG'],
-              'inputs': {
-                  'version': os.environ['VERSION'],
-                  'channel': os.environ['CHANNEL'],
-                  'source_repo': 'overdev-l/marketing-studio-ci',
-              },
-          }))
-          PY
-          )
-          HTTP_STATUS=$(curl -sS -o /tmp/sync-r2-response.json -w "%{http_code}" \
-            -X POST \
-            -H "Accept: application/vnd.github.v3+json" \
-            -H "Authorization: token ${MARKETING_STUDIO_REPO_PAT}" \
-            -H "Content-Type: application/json" \
-            "https://api.github.com/repos/overdev-team/marketing-studio/actions/workflows/sync-app-updates-r2.yml/dispatches" \
-            -d "${payload}")
-          if [ "${HTTP_STATUS}" != "204" ]; then
-            cat /tmp/sync-r2-response.json
-            echo "❌ 触发源仓库 R2 同步失败 (HTTP ${HTTP_STATUS})"
-            exit 1
-          fi
-          echo "✅ 已触发源仓库 R2 同步：${TAG}"
 
       - name: Feishu notification
         working-directory: workspace
