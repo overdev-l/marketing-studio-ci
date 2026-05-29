@@ -24,9 +24,6 @@ env:
   TAG: ${{ github.event.client_payload.tag }}
   CHANNEL: ${{ github.event.client_payload.channel }}
   VERSION: ${{ github.event.client_payload.version }}
-  # 让 v4 JS actions (setup-node/setup-dotnet/upload-artifact) 内部跑在 Node 24 上,
-  # 提前对齐 2026-06-02 GitHub 强制切换,消除 deprecation 警告。与项目构建用的 Node 25 独立。
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   build:
@@ -55,12 +52,12 @@ jobs:
           git fetch --tags
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '25'
 
       - name: Setup .NET (for Velopack vpk)
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
 
@@ -197,7 +194,7 @@ jobs:
           ls -lh "$CURRENT_DIR"
 
       - name: Upload dist artifact (${{ matrix.arch }})
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.arch }}
           # 只上传当前版本产物。上一版 full nupkg 只用于生成 delta，不进入 artifact。
@@ -225,7 +222,7 @@ jobs:
           git fetch --tags
 
       - name: Download dist artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: workspace/release
           pattern: dist-*
@@ -286,7 +283,7 @@ jobs:
           cat changelog.txt
 
       - name: Create GitHub Release (tag=VERSION)
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.TAG }}
           name: "Marketing Studio v${{ env.VERSION }}"
