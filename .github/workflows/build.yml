@@ -1,12 +1,12 @@
 # Marketing Studio Electron 应用 — GitHub Actions 构建 + 发布（Velopack 自动更新）
 # 触发方式：overdev-team/marketing-studio 通过 Repository Dispatch API 触发
 # 产物：
-#   - tag=<version>: marketing-studio-<v>-{arm64,x64}.pkg + Velopack feed assets
+#   - tag=<version>: marketing-studio-<v>-{arm64,x64}.pkg + 当前版本 Velopack feed assets
 #     (Velopack Setup.pkg,装上后即享受自动更新。原 dmg/zip 已废弃,
 #      dmg 安装的 .app 没有 Velopack runtime metadata,自动更新无法工作。
 #      版本 release 也必须带 releases.osx*.json + nupkg,否则 GitHubSource
 #      只扫描最近 10 个 release 时会跳过固定 update tag)
-#   - tag=update: releases.osx.json / releases.osx-x64.json + *.nupkg + *.pkg + *.Portable.zip
+#   - tag=update: releases.osx.json / releases.osx-x64.json + 当前版本 *.nupkg + *.pkg + *.Portable.zip
 #     (Velopack 自动更新通道)
 #
 # 结构：
@@ -71,7 +71,7 @@ jobs:
           "$HOME/.dotnet/tools/vpk" --help | head -n 5
 
       - name: Install pnpm
-        run: npm install -g pnpm@10.31.0
+        run: npm install -g pnpm@11.4.0
 
       - name: Install dependencies
         working-directory: workspace
@@ -116,42 +116,58 @@ jobs:
           echo "electron-builder .app 产物:"
           ls -lh release/mac release/mac-${ARCH} 2>/dev/null || true
 
-      - name: Pre-fetch previous Velopack nupkgs (${{ matrix.arch }})
+      - name: Pre-fetch previous Velopack full nupkg (${{ matrix.arch }})
         working-directory: workspace
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 增量 delta 需要上一版 full nupkg 在 outputDir。只拉当前 arch 的 channel。
+          # 增量 delta 只需要上一版 full nupkg 在 outputDir，不需要把所有历史包搬一遍。
           REPO="overdev-l/marketing-studio-ci"
           mkdir -p release/velopack-${ARCH}
 
           ASSETS_JSON=$(curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
             "https://api.github.com/repos/${REPO}/releases/tags/update" 2>/dev/null || echo '{"assets":[]}')
 
-          echo "$ASSETS_JSON" | ARCH="$ARCH" python3 -c "
-          import sys, json, os
-          data = json.load(sys.stdin) if sys.stdin else {'assets': []}
+          PREVIOUS_FULL=$(echo "$ASSETS_JSON" | ARCH="$ARCH" VERSION="$VERSION" python3 -c "
+          import sys, json, os, re
+          data = json.load(sys.stdin) if not sys.stdin.isatty() else {'assets': []}
           arch = os.environ['ARCH']
+          version = tuple(int(x) for x in os.environ['VERSION'].split('.'))
+          candidates = []
           for a in (data.get('assets') or []):
               name = a['name']
-              if not name.endswith('.nupkg'):
+              if not name.endswith('-full.nupkg'):
                   continue
               asset_arch = 'x64' if '-osx-x64-' in name else 'arm64'
               if asset_arch != arch:
                   continue
-              print(f\"{a['url']}\t{name}\")
-          " | while IFS=$'\t' read -r ASSET_API_URL NAME; do
-              [ -z "${NAME}" ] && continue
-              DEST="release/velopack-${ARCH}/${NAME}"
-              [ -f "$DEST" ] && { echo "跳过已存在 ${DEST}"; continue; }
-              echo "下载 ${NAME}"
-              curl -fsSL \
-                -H "Authorization: token ${GITHUB_TOKEN}" \
-                -H "Accept: application/octet-stream" \
-                -o "${DEST}" \
-                "${ASSET_API_URL}" || echo "(skip ${NAME})"
-            done
+              match = re.search(r'-(\d+\.\d+\.\d+)-osx(?:-x64)?-full\.nupkg$', name)
+              if not match:
+                  continue
+              try:
+                  asset_version = tuple(int(x) for x in match.group(1).split('.'))
+              except ValueError:
+                  continue
+              if asset_version < version:
+                  candidates.append((asset_version, a['url'], name))
+          if candidates:
+              _, url, name = sorted(candidates)[-1]
+              print(f'{url}\t{name}')
+          ")
+
+          if [ -z "$PREVIOUS_FULL" ]; then
+            echo "没有可用上一版 full nupkg，跳过 delta prefetch"
+          else
+            IFS=$'\t' read -r ASSET_API_URL NAME <<< "$PREVIOUS_FULL"
+            DEST="release/velopack-${ARCH}/${NAME}"
+            echo "下载上一版 full nupkg: ${NAME}"
+            curl -fsSL \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o "${DEST}" \
+              "${ASSET_API_URL}"
+          fi
           ls -lh release/velopack-${ARCH}/ 2>/dev/null || true
 
       - name: Pack Velopack release (${{ matrix.arch }})
@@ -167,12 +183,25 @@ jobs:
           MANIFEST="release/velopack-${ARCH}/releases.${VELOPACK_CHANNEL}.json"
           test -f "$MANIFEST" || { echo "缺少 $MANIFEST"; exit 1; }
 
+          CURRENT_DIR="release/current-${ARCH}"
+          rm -rf "$CURRENT_DIR"
+          mkdir -p "$CURRENT_DIR"
+          cp "release/velopack-${ARCH}/releases.${VELOPACK_CHANNEL}.json" "$CURRENT_DIR/"
+          cp "release/velopack-${ARCH}/assets.${VELOPACK_CHANNEL}.json" "$CURRENT_DIR/"
+          cp "release/velopack-${ARCH}/RELEASES-${VELOPACK_CHANNEL}" "$CURRENT_DIR/"
+          cp "release/velopack-${ARCH}/com.overdev.marketing-studio-${VERSION}-${VELOPACK_CHANNEL}-full.nupkg" "$CURRENT_DIR/"
+          cp "release/velopack-${ARCH}/com.overdev.marketing-studio-${VERSION}-${VELOPACK_CHANNEL}-delta.nupkg" "$CURRENT_DIR/"
+          cp "release/velopack-${ARCH}/com.overdev.marketing-studio-${VELOPACK_CHANNEL}-Setup.pkg" "$CURRENT_DIR/"
+          cp "release/velopack-${ARCH}/com.overdev.marketing-studio-${VELOPACK_CHANNEL}-Portable.zip" "$CURRENT_DIR/"
+          echo "当前版本 artifact:"
+          ls -lh "$CURRENT_DIR"
+
       - name: Upload dist artifact (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.arch }}
-          # Setup.pkg / Portable.zip / nupkg / manifest 都在 velopack-${arch}/ 里
-          path: workspace/release/velopack-${{ matrix.arch }}/
+          # 只上传当前版本产物。上一版 full nupkg 只用于生成 delta，不进入 artifact。
+          path: workspace/release/current-${{ matrix.arch }}/
           if-no-files-found: error
           retention-days: 7
 
@@ -275,6 +304,7 @@ jobs:
       - name: Update channel release (tag=update) — Velopack
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           CHANNEL_TAG="update"
@@ -301,54 +331,25 @@ jobs:
           fi
           echo "Release ID: ${RELEASE_ID}"
 
-          # 2. 收集 vpk 原始产物名 (排除我们 cp 重命名给 tag=<version> 的友好 .pkg);
-          #    仅这些会进 update channel 的"同名 asset 替换"逻辑
-          TO_UPLOAD=""
+          # 2. 只上传当前版本 vpk 产物。历史 nupkg 留在 update release 里，不重复下载/上传。
+          UPLOAD_FILES=()
           for f in workspace/release/*; do
             [ -f "$f" ] || continue
             NAME=$(basename "$f")
             case "$NAME" in
               marketing-studio-*.pkg) continue ;;
             esac
-            TO_UPLOAD="${TO_UPLOAD}${NAME}|"
+            UPLOAD_FILES+=("$f")
           done
 
-          curl -fsSL -H "Authorization: token ${GITHUB_TOKEN}" \
-            "https://api.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?per_page=100" \
-            | TO_UPLOAD="$TO_UPLOAD" python3 -c "
-          import sys, json, os
-          to_upload = set([n for n in os.environ.get('TO_UPLOAD','').split('|') if n])
-          for a in json.load(sys.stdin):
-              if a['name'] in to_upload:
-                  print(a['id'], a['name'])
-          " | while read -r ASSET_ID ASSET_NAME; do
-              [ -z "$ASSET_ID" ] && continue
-              echo "删除同名旧 asset ${ASSET_NAME} (${ASSET_ID})"
-              curl -fsSL -X DELETE \
-                -H "Authorization: token ${GITHUB_TOKEN}" \
-                "https://api.github.com/repos/${REPO}/releases/assets/${ASSET_ID}" || true
-            done
+          if [ "${#UPLOAD_FILES[@]}" -eq 0 ]; then
+            echo "❌ 没有可上传的 update assets"
+            exit 1
+          fi
 
-          # 3. 上传扁平 release/ 下所有 vpk 产物 (nupkg / json / yml / Setup.pkg / Portable.zip / RELEASES)
-          for f in workspace/release/*; do
-            [ -f "$f" ] || continue
-            NAME=$(basename "$f")
-            case "$NAME" in
-              marketing-studio-*.pkg) continue ;;
-            esac
-            CONTENT_TYPE="application/octet-stream"
-            case "$NAME" in
-              *.json) CONTENT_TYPE="application/json" ;;
-              *.yml|*.yaml) CONTENT_TYPE="text/yaml" ;;
-            esac
-            echo "上传 ${NAME} (${CONTENT_TYPE})"
-            curl -fsSL -X POST \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: ${CONTENT_TYPE}" \
-              --data-binary "@${f}" \
-              "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${NAME}" \
-              > /dev/null
-          done
+          printf '上传当前版本 update assets:\n'
+          printf '  %s\n' "${UPLOAD_FILES[@]}"
+          gh release upload "${CHANNEL_TAG}" "${UPLOAD_FILES[@]}" --repo "${REPO}" --clobber
           echo "✅ update 通道已发布 osx + osx-x64（v${VERSION}）"
 
       - name: Feishu notification
