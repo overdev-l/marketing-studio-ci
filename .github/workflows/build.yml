@@ -6,13 +6,13 @@
 #      dmg 安装的 .app 没有 Velopack runtime metadata,自动更新无法工作。
 #      版本 release 也必须带 releases.osx*.json + nupkg,否则 GitHubSource
 #      只扫描最近 10 个 release 时会跳过固定 update tag)
-#   - tag=update: releases.osx.json / releases.osx-x64.json + 当前版本 *.nupkg + *.pkg + *.Portable.zip
-#     (Velopack 自动更新通道)
+#   - tag=update: GitHub 兼容通道，供旧客户端继续升级
+#   - R2/CDN: updates/releases.* 稳定入口 + updates/<git-tag>/ 不可变版本目录
 #
 # 结构：
 #   build (matrix arm64/x64) — 各自 clone/install/electron-builder --dir/vpk pack/upload artifact，并行
 #   release (needs: build)   — 下载两份 artifact，把 vpk Setup.pkg 重命名为友好名后发 GH Release、
-#                              更新 update channel、飞书通知
+#                              更新 GitHub update channel、同步 R2 静态源、飞书通知
 
 name: Build & Deploy
 
@@ -349,16 +349,172 @@ jobs:
           gh release upload "${CHANNEL_TAG}" "${UPLOAD_FILES[@]}" --repo "${REPO}" --clobber
           echo "✅ update 通道已发布 osx + osx-x64（v${VERSION}）"
 
+      - name: Upload update channel to R2 — Velopack HTTP source
+        working-directory: workspace
+        env:
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+          R2_UPDATE_KEY_PREFIX: ${{ vars.R2_UPDATE_KEY_PREFIX || 'updates' }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for key in R2_ACCOUNT_ID R2_BUCKET R2_PUBLIC_BASE_URL R2_UPDATE_KEY_PREFIX AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY CLOUDFLARE_API_TOKEN CLOUDFLARE_ZONE_ID; do
+            val="$(printenv "${key}" || true)"
+            if [ -z "${val}" ]; then
+              echo "::error::缺失 ${key}"
+              exit 1
+            fi
+          done
+
+          if ! command -v aws >/dev/null 2>&1; then
+            python3 -m pip install --user awscli
+            export PATH="${HOME}/.local/bin:${PATH}"
+          fi
+
+          BASE_URL="${R2_PUBLIC_BASE_URL%/}"
+          case "${BASE_URL}" in
+            http://*|https://*) : ;;
+            *) BASE_URL="https://${BASE_URL}" ;;
+          esac
+          PREFIX="${R2_UPDATE_KEY_PREFIX#/}"
+          PREFIX="${PREFIX%/}"
+          VERSION_DIR="${VERSION}"
+          ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          REPO="overdev-l/marketing-studio-ci"
+          STAGE_DIR="$(mktemp -d)"
+          mkdir -p "${STAGE_DIR}/${PREFIX}/${VERSION_DIR}"
+
+          # 所有当前版本产物进不可变版本目录：updates/0.1.68/...
+          for f in release/*; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f")
+            cp "$f" "${STAGE_DIR}/${PREFIX}/${VERSION_DIR}/${NAME}"
+          done
+
+          if ! compgen -G "${STAGE_DIR}/${PREFIX}/${VERSION_DIR}/*" >/dev/null; then
+            echo "❌ 没有可上传的 R2 update assets"
+            exit 1
+          fi
+
+          # 稳定入口保留在 updates/ 根部；manifest 里的文件名改为 <git-tag>/...
+          # 这样客户端永远查同一个 updateUrl，实际包文件又能按版本隔离。
+          export STAGE_DIR PREFIX VERSION VERSION_DIR
+          python3 <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          stage = Path(os.environ['STAGE_DIR'])
+          prefix = os.environ['PREFIX']
+          current_version = os.environ['VERSION']
+          root = stage / prefix
+          release = Path('release')
+
+          def versioned(name):
+              clean = str(name).lstrip('/')
+              if '/' in clean:
+                  return clean
+              match = re.search(r'-(\d+\.\d+\.\d+)-', clean)
+              version = match.group(1) if match else current_version
+              return f'{version}/{clean}'
+
+          referenced = set()
+          for file_name in ('releases.osx.json', 'releases.osx-x64.json'):
+              data = json.loads((release / file_name).read_text())
+              for asset in data.get('Assets', []):
+                  if 'FileName' in asset:
+                      asset['FileName'] = versioned(asset['FileName'])
+                      referenced.add(asset['FileName'])
+              (root / file_name).write_text(json.dumps(data, ensure_ascii=False, separators=(',', ':')) + '\n')
+
+          for file_name in ('assets.osx.json', 'assets.osx-x64.json'):
+              data = json.loads((release / file_name).read_text())
+              for asset in data:
+                  if 'RelativeFileName' in asset:
+                      asset['RelativeFileName'] = versioned(asset['RelativeFileName'])
+                      referenced.add(asset['RelativeFileName'])
+              (root / file_name).write_text(json.dumps(data, ensure_ascii=False, separators=(',', ':')) + '\n')
+
+          (stage / 'referenced-assets.txt').write_text('\n'.join(sorted(referenced)) + '\n')
+          PY
+
+          # manifest 可能引用上一版 full nupkg；当前 release/ 没有时，从 GitHub update
+          # 兼容通道补齐到对应版本目录。
+          while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            target="${STAGE_DIR}/${PREFIX}/${rel}"
+            [ -f "$target" ] && continue
+
+            name=$(basename "$rel")
+            mkdir -p "$(dirname "$target")"
+            if [ -f "release/${name}" ]; then
+              cp "release/${name}" "$target"
+            else
+              tmp_download="$(mktemp -d)"
+              gh release download update --repo "${REPO}" --pattern "${name}" --dir "${tmp_download}"
+              cp "${tmp_download}/${name}" "$target"
+            fi
+          done < "${STAGE_DIR}/referenced-assets.txt"
+
+          PURGE_URLS=()
+          printf '同步 R2 update assets:\n'
+          while IFS= read -r -d '' f; do
+            KEY="${f#${STAGE_DIR}/}"
+            NAME=$(basename "$f")
+            case "$NAME" in
+              *.json) CONTENT_TYPE="application/json; charset=utf-8" ;;
+              *.pkg) CONTENT_TYPE="application/octet-stream" ;;
+              *.zip) CONTENT_TYPE="application/zip" ;;
+              *) CONTENT_TYPE="application/octet-stream" ;;
+            esac
+            case "$KEY" in
+              "${PREFIX}"/*/*)
+                CACHE_CONTROL="public, max-age=31536000, immutable"
+                ;;
+              *)
+                CACHE_CONTROL="public, max-age=60, must-revalidate"
+                ;;
+            esac
+            printf '  %s → s3://%s/%s\n' "$NAME" "$R2_BUCKET" "$KEY"
+            aws s3 cp "$f" "s3://${R2_BUCKET}/${KEY}" \
+              --endpoint-url "$ENDPOINT" \
+              --content-type "$CONTENT_TYPE" \
+              --cache-control "$CACHE_CONTROL"
+            PURGE_URLS+=("${BASE_URL}/${KEY}")
+          done < <(find "${STAGE_DIR}/${PREFIX}" -type f -print0)
+
+          PURGE_BODY=$(printf '%s\n' "${PURGE_URLS[@]}" | python3 -c 'import sys,json; print(json.dumps({"files":[line.strip() for line in sys.stdin if line.strip()]}))')
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache" \
+            -d "$PURGE_BODY" >/dev/null
+          echo "✅ R2 静态更新源已同步：${BASE_URL}/${PREFIX}"
+
       - name: Feishu notification
         working-directory: workspace
         env:
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+          R2_UPDATE_KEY_PREFIX: ${{ vars.R2_UPDATE_KEY_PREFIX || 'updates' }}
           FEISHU_WEBHOOK: https://open.feishu.cn/open-apis/bot/v2/hook/2ab8aae4-a857-46f5-8b99-14e3f7ceba80
         run: |
           # 用 Prepare 步骤已经 cp 好的友好命名 .pkg。Setup.pkg 才有 Velopack runtime,
           # 装上后 app 自动更新链路才会工作;dmg 已废弃。
           PKG_ARM64="marketing-studio-${VERSION}-arm64.pkg"
           PKG_X64="marketing-studio-${VERSION}-x64.pkg"
-          REL_BASE="https://github.com/overdev-l/marketing-studio-ci/releases/download/${TAG}"
+          BASE_URL="${R2_PUBLIC_BASE_URL%/}"
+          case "${BASE_URL}" in
+            http://*|https://*) : ;;
+            *) BASE_URL="https://${BASE_URL}" ;;
+          esac
+          PREFIX="${R2_UPDATE_KEY_PREFIX#/}"
+          PREFIX="${PREFIX%/}"
+          REL_BASE="${BASE_URL}/${PREFIX}/${VERSION}"
           export PKG_URL_ARM64="${REL_BASE}/${PKG_ARM64}"
           export PKG_URL_X64="${REL_BASE}/${PKG_X64}"
           # Windows 暂未构建。CI 一旦加 windows job,只需在此 export WIN_URL=... 即可让按钮自动出现。
