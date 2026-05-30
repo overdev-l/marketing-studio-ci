@@ -12,7 +12,7 @@
 # 结构：
 #   build (matrix arm64/x64) — 各自 clone/install/electron-builder --dir/vpk pack/upload artifact，并行
 #   release (needs: build)   — 下载两份 artifact，把 vpk Setup.pkg 重命名为友好名后发 GH Release、
-#                              更新 GitHub update channel、同步 R2 静态源、飞书通知
+#                              更新 GitHub update channel、同步 R2 静态源、清理旧 R2 版本、飞书通知
 
 name: Build & Deploy
 
@@ -356,6 +356,7 @@ jobs:
           R2_BUCKET: ${{ vars.R2_BUCKET }}
           R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
           R2_UPDATE_KEY_PREFIX: ${{ vars.R2_UPDATE_KEY_PREFIX || 'updates' }}
+          R2_UPDATE_KEEP_VERSIONS: ${{ vars.R2_UPDATE_KEEP_VERSIONS || '2' }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -495,6 +496,96 @@ jobs:
             "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache" \
             -d "$PURGE_BODY" >/dev/null
           echo "✅ R2 静态更新源已同步：${BASE_URL}/${PREFIX}"
+
+          echo "清理 R2 旧 update 版本：保留最近 ${R2_UPDATE_KEEP_VERSIONS} 个版本目录"
+          export ENDPOINT R2_BUCKET PREFIX R2_UPDATE_KEEP_VERSIONS STAGE_DIR
+          python3 <<'PY'
+          import json, os, re, subprocess, sys, tempfile
+          from pathlib import Path
+
+          endpoint = os.environ['ENDPOINT']
+          bucket = os.environ['R2_BUCKET']
+          prefix = os.environ['PREFIX'].strip('/')
+          stage = Path(os.environ['STAGE_DIR'])
+          keep_count = int(os.environ.get('R2_UPDATE_KEEP_VERSIONS', '2'))
+          if keep_count < 2:
+              raise SystemExit('R2_UPDATE_KEEP_VERSIONS 必须 >= 2，避免自动更新链路只剩一个版本')
+
+          semver_re = re.compile(rf'^{re.escape(prefix)}/(\d+\.\d+\.\d+)/')
+
+          def semver_key(version):
+              return tuple(int(part) for part in version.split('.'))
+
+          def run_json(args):
+              result = subprocess.run(args, check=True, text=True, capture_output=True)
+              return json.loads(result.stdout or '{}')
+
+          protected = set()
+          for manifest_name in ('releases.osx.json', 'releases.osx-x64.json'):
+              manifest_path = stage / prefix / manifest_name
+              if not manifest_path.exists():
+                  continue
+              data = json.loads(manifest_path.read_text())
+              for asset in data.get('Assets', []):
+                  file_name = str(asset.get('FileName') or '').lstrip('/')
+                  if file_name:
+                      protected.add(f'{prefix}/{file_name}')
+
+          listed = run_json([
+              'aws', 's3api', 'list-objects-v2',
+              '--bucket', bucket,
+              '--prefix', f'{prefix}/',
+              '--endpoint-url', endpoint,
+          ])
+          objects = listed.get('Contents') or []
+          versions = sorted(
+              {match.group(1) for obj in objects for match in [semver_re.match(obj.get('Key', ''))] if match},
+              key=semver_key,
+              reverse=True,
+          )
+          keep_versions = set(versions[:keep_count])
+
+          delete_keys = []
+          reclaim_bytes = 0
+          for obj in objects:
+              key = obj.get('Key', '')
+              match = semver_re.match(key)
+              if not match:
+                  continue
+              version = match.group(1)
+              if version in keep_versions or key in protected:
+                  continue
+              delete_keys.append(key)
+              reclaim_bytes += int(obj.get('Size') or 0)
+
+          print(f'  已发现版本目录: {", ".join(versions) if versions else "(无)"}')
+          print(f'  保留版本目录: {", ".join(sorted(keep_versions, key=semver_key, reverse=True)) if keep_versions else "(无)"}')
+          print(f'  当前 manifest 保护对象: {len(protected)} 个')
+          if not delete_keys:
+              print('  无需删除旧版本对象')
+              sys.exit(0)
+
+          print(f'  将删除旧对象: {len(delete_keys)} 个，预计释放 {reclaim_bytes / 1024 / 1024:.1f} MiB')
+          for key in delete_keys:
+              print(f'    delete {key}')
+
+          for i in range(0, len(delete_keys), 1000):
+              batch = delete_keys[i:i + 1000]
+              payload = {'Objects': [{'Key': key} for key in batch], 'Quiet': False}
+              with tempfile.NamedTemporaryFile('w', delete=False) as f:
+                  json.dump(payload, f)
+                  payload_path = f.name
+              try:
+                  subprocess.run([
+                      'aws', 's3api', 'delete-objects',
+                      '--bucket', bucket,
+                      '--delete', f'file://{payload_path}',
+                      '--endpoint-url', endpoint,
+                  ], check=True)
+              finally:
+                  Path(payload_path).unlink(missing_ok=True)
+          print('✅ R2 旧 update 版本已清理')
+          PY
 
       - name: Feishu notification
         working-directory: workspace
