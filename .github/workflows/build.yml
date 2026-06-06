@@ -605,15 +605,24 @@ jobs:
       - name: Feishu notification
         working-directory: workspace
         env:
+          R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+          R2_UPDATE_KEY_PREFIX: ${{ vars.R2_UPDATE_KEY_PREFIX || 'updates' }}
           FEISHU_WEBHOOK: https://open.feishu.cn/open-apis/bot/v2/hook/2ab8aae4-a857-46f5-8b99-14e3f7ceba80
         run: |
           # 用 Prepare 步骤已经 cp 好的友好命名 .pkg。Setup.pkg 才有 Velopack runtime,
           # 装上后 app 自动更新链路才会工作;dmg 已废弃。
           PKG_ARM64="marketing-studio-${VERSION}-arm64.pkg"
           PKG_X64="marketing-studio-${VERSION}-x64.pkg"
-          RELEASE_BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}"
-          export PKG_URL_ARM64="${RELEASE_BASE}/${PKG_ARM64}"
-          export PKG_URL_X64="${RELEASE_BASE}/${PKG_X64}"
+          BASE_URL="${R2_PUBLIC_BASE_URL%/}"
+          case "${BASE_URL}" in
+            http://*|https://*) : ;;
+            *) BASE_URL="https://${BASE_URL}" ;;
+          esac
+          PREFIX="${R2_UPDATE_KEY_PREFIX#/}"
+          PREFIX="${PREFIX%/}"
+          REL_BASE="${BASE_URL}/${PREFIX}/${VERSION}"
+          export PKG_URL_ARM64="${REL_BASE}/${PKG_ARM64}"
+          export PKG_URL_X64="${REL_BASE}/${PKG_X64}"
           # Windows 暂未构建。CI 一旦加 windows job,只需在此 export WIN_URL=... 即可让按钮自动出现。
           export WIN_URL=""
           cat > /tmp/feishu.py <<'PYEOF'
