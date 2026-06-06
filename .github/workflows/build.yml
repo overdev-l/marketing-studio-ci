@@ -427,6 +427,12 @@ jobs:
           referenced = set()
           for file_name in ('releases.osx.json', 'releases.osx-x64.json'):
               data = json.loads((release / file_name).read_text())
+              # .pkg 安装后的 macOS 客户端本地没有当前版本 full nupkg。
+              # R2 稳定更新源只暴露 Full，避免 Velopack 优先尝试 Delta 后因缺 base 包失败。
+              data['Assets'] = [
+                  asset for asset in data.get('Assets', [])
+                  if str(asset.get('Type', '')).lower() != 'delta'
+              ]
               for asset in data.get('Assets', []):
                   if 'FileName' in asset:
                       asset['FileName'] = versioned(asset['FileName'])
